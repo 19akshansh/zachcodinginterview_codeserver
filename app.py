@@ -157,7 +157,7 @@ def execute(req: ExecuteRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "build": "bullseye-glibc-pin-1"}
 
 
 @app.get("/debug/limits", dependencies=[Depends(require_api_key)])

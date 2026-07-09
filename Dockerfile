@@ -1,30 +1,25 @@
-FROM python:3.12-alpine
+# Pinned to Debian Bullseye specifically (not just "slim", which now floats
+# to Bookworm/glibc 2.36+). Bullseye ships glibc 2.31 — below the 2.34
+# threshold where glibc's pthread_create started defaulting to the clone3
+# syscall. Render's free-tier sandbox appears to block clone3 outright
+# (regardless of libc — we confirmed this isn't glibc-specific by testing
+# musl/Alpine, which hit the identical crash), so the fix is to avoid ever
+# calling it in the first place by staying on an older libc.
+FROM python:3.12-slim-bullseye
 
-# Alpine uses musl libc instead of glibc. This matters specifically for
-# Node.js: glibc >= 2.34 uses the clone3 syscall for pthread_create by
-# default, and some restricted/sandboxed container runtimes (seen on
-# Render's free tier) block clone3 via seccomp — which crashes Node.js on
-# startup with "Assertion failed: (0) == (uv_thread_create(...))" before
-# any script even runs. Musl's pthread implementation doesn't have this
-# dependency, so Node runs fine here. (See nodejs/node#43064 for the
-# upstream bug writeup.)
-RUN apk add --no-cache nodejs npm
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
-
-# fastapi/pydantic/python-dotenv are pure Python or ship musllinux wheels,
-# so this installs cleanly without extra build tooling in the common case.
-# If pip ever fails trying to compile something from source here, add:
-#   RUN apk add --no-cache gcc musl-dev python3-dev
-# above this line, then retry.
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Run as a non-root user — this is the one privilege restriction that
-# actually helps here, and it works fine without --privileged.
-RUN adduser -D runner
+RUN useradd --create-home runner
 USER runner
 
 EXPOSE 8000
