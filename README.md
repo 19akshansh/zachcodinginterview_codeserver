@@ -4,6 +4,6 @@
 
 ### Supports: 
 
-[x] Python
-[x] Javascript(node)
+- [x] Python
+- [x] Javascript(node)
 
