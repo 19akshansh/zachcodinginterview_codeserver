@@ -3,11 +3,22 @@ Lightweight code-execution runner for an interview platform.
 
 Runs untrusted Python/JS as a subprocess with OS-level resource limits
 instead of relying on Docker/privileged containers. Weaker isolation than
-Piston, but deployable on any plain PaaS (Render, etc.) since it needs no
-special container privileges.
+Piston, but deployable anywhere that needs no special container
+privileges — including directly inside Termux on a phone.
+
+History note: Node.js was previously dropped when this ran on Render's free
+tier, because Render's sandbox blocks the clone3 syscall Node's thread
+startup depends on (Assertion failed: (0) == (uv_thread_create(...))).
+That's a host-level restriction of Render's shared containers specifically
+— it does not apply when running directly on a real Linux kernel (a normal
+VPS, or Termux on Android), so JavaScript is back in for those targets.
+If you deploy this back onto Render's free tier, expect the JS runtime to
+fail there again for the same reason as before.
 
 NOT bulletproof — see README "Known limitations" before relying on this
-for anonymous, unproctored, adversarial users.
+for anonymous, unproctored, adversarial users. This matters even more if
+you're running it on your own phone via Termux: the sandboxing below is
+what stands between candidate-submitted code and your actual device.
 """
 
 import os
@@ -22,7 +33,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-load_dotenv()  # reads .env in local dev; on Render, env vars come from the dashboard instead
+load_dotenv()  # reads .env in local dev / Termux; on Render, env vars come from the dashboard instead
 
 app = FastAPI()
 
@@ -46,25 +57,6 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
 
-RUNTIMES = {
-    "python": {"cmd": ["python3", "{file}"], "ext": "py", "limits": None},  # set below
-    "javascript": {"cmd": ["node", "--v8-pool-size=0", "--max-old-space-size=150", "{file}"], "ext": "js", "limits": None},
-}
-
-
-class ExecuteRequest(BaseModel):
-    language: str
-    code: str
-    stdin: Optional[str] = ""
-
-
-class ExecuteResponse(BaseModel):
-    stdout: str
-    stderr: str
-    exit_code: Optional[int]
-    timed_out: bool
-    error: Optional[str] = None
-
 
 def _apply_limits_python():
     resource.setrlimit(resource.RLIMIT_CPU, (CPU_TIME_LIMIT_SECONDS, CPU_TIME_LIMIT_SECONDS))
@@ -85,8 +77,28 @@ def _apply_limits_node():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
-RUNTIMES["python"]["limits"] = _apply_limits_python
-RUNTIMES["javascript"]["limits"] = _apply_limits_node
+RUNTIMES = {
+    "python": {"cmd": ["python3", "{file}"], "ext": "py", "limits": _apply_limits_python},
+    "javascript": {
+        "cmd": ["node", "--v8-pool-size=0", "--max-old-space-size=150", "{file}"],
+        "ext": "js",
+        "limits": _apply_limits_node,
+    },
+}
+
+
+class ExecuteRequest(BaseModel):
+    language: str
+    code: str
+    stdin: Optional[str] = ""
+
+
+class ExecuteResponse(BaseModel):
+    stdout: str
+    stderr: str
+    exit_code: Optional[int]
+    timed_out: bool
+    error: Optional[str] = None
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
@@ -99,7 +111,11 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
 @app.post("/execute", response_model=ExecuteResponse, dependencies=[Depends(require_api_key)])
 def execute(req: ExecuteRequest):
     if req.language not in RUNTIMES:
-        raise HTTPException(status_code=400, detail=f"Unsupported language: {req.language}")
+        supported = ", ".join(sorted(RUNTIMES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language: {req.language}. Supported: {supported}",
+        )
 
     runtime = RUNTIMES[req.language]
     job_id = str(uuid.uuid4())
@@ -114,9 +130,7 @@ def execute(req: ExecuteRequest):
 
     # Minimal, clean environment — don't leak host secrets/env vars into
     # candidate code. UV_THREADPOOL_SIZE keeps Node's libuv thread pool
-    # small on purpose: RLIMIT_NPROC is a per-UID system-wide limit (not
-    # per-process), and this server's own thread pool (FastAPI runs sync
-    # handlers in a thread pool) already eats into that same ceiling.
+    # small on purpose — cheap to keep even where clone3 isn't an issue.
     clean_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": job_dir,
@@ -157,34 +171,4 @@ def execute(req: ExecuteRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "build": "bullseye-glibc-pin-1"}
-
-
-@app.get("/debug/limits", dependencies=[Depends(require_api_key)])
-def debug_limits():
-    """
-    TEMPORARY diagnostic endpoint — remove once the Node thread-limit issue
-    is confirmed fixed. Reads the container's actual cgroup ceilings, which
-    can be stricter than anything set via resource.setrlimit() in-process.
-    """
-    def read_file(path: str) -> Optional[str]:
-        try:
-            with open(path) as f:
-                return f.read().strip()
-        except Exception as e:
-            return f"<unreadable: {e}>"
-
-    return {
-        # cgroup v2 paths (most current Docker/Render hosts)
-        "cgroup_pids_max": read_file("/sys/fs/cgroup/pids.max"),
-        "cgroup_pids_current": read_file("/sys/fs/cgroup/pids.current"),
-        "cgroup_memory_max": read_file("/sys/fs/cgroup/memory.max"),
-        "cgroup_memory_current": read_file("/sys/fs/cgroup/memory.current"),
-        # cgroup v1 fallback paths (older hosts)
-        "cgroup_v1_pids_max": read_file("/sys/fs/cgroup/pids/pids.max"),
-        "cgroup_v1_pids_current": read_file("/sys/fs/cgroup/pids/pids.current"),
-        # this server process's own rlimits, for comparison
-        "rlimit_nproc": resource.getrlimit(resource.RLIMIT_NPROC),
-        "rlimit_as": resource.getrlimit(resource.RLIMIT_AS),
-        "configured_max_processes": MAX_PROCESSES,
-    }
+    return {"status": "ok", "build": "python-js-1", "languages": sorted(RUNTIMES)}
