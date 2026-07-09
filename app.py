@@ -31,7 +31,7 @@ app = FastAPI()
 CPU_TIME_LIMIT_SECONDS = int(os.environ.get("CPU_TIME_LIMIT_SECONDS", 3))
 WALL_TIME_LIMIT_SECONDS = int(os.environ.get("WALL_TIME_LIMIT_SECONDS", 5))
 MEMORY_LIMIT_BYTES = int(os.environ.get("MEMORY_LIMIT_MB", 200)) * 1024 * 1024
-MAX_PROCESSES = int(os.environ.get("MAX_PROCESSES", 20))
+MAX_PROCESSES = int(os.environ.get("MAX_PROCESSES", 64))
 MAX_OPEN_FILES = int(os.environ.get("MAX_OPEN_FILES", 64))
 MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", 100_000))
 
@@ -48,7 +48,7 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)):
 
 RUNTIMES = {
     "python": {"cmd": ["python3", "{file}"], "ext": "py", "limits": None},  # set below
-    "javascript": {"cmd": ["node", "--max-old-space-size=150", "{file}"], "ext": "js", "limits": None},
+    "javascript": {"cmd": ["node", "--v8-pool-size=0", "--max-old-space-size=150", "{file}"], "ext": "js", "limits": None},
 }
 
 
@@ -113,10 +113,14 @@ def execute(req: ExecuteRequest):
     cmd = [part.format(file=file_path) for part in runtime["cmd"]]
 
     # Minimal, clean environment — don't leak host secrets/env vars into
-    # candidate code.
+    # candidate code. UV_THREADPOOL_SIZE keeps Node's libuv thread pool
+    # small on purpose: RLIMIT_NPROC is a per-UID system-wide limit (not
+    # per-process), and this server's own thread pool (FastAPI runs sync
+    # handlers in a thread pool) already eats into that same ceiling.
     clean_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": job_dir,
+        "UV_THREADPOOL_SIZE": "1",
     }
 
     timed_out = False
@@ -154,3 +158,33 @@ def execute(req: ExecuteRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/debug/limits", dependencies=[Depends(require_api_key)])
+def debug_limits():
+    """
+    TEMPORARY diagnostic endpoint — remove once the Node thread-limit issue
+    is confirmed fixed. Reads the container's actual cgroup ceilings, which
+    can be stricter than anything set via resource.setrlimit() in-process.
+    """
+    def read_file(path: str) -> Optional[str]:
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except Exception as e:
+            return f"<unreadable: {e}>"
+
+    return {
+        # cgroup v2 paths (most current Docker/Render hosts)
+        "cgroup_pids_max": read_file("/sys/fs/cgroup/pids.max"),
+        "cgroup_pids_current": read_file("/sys/fs/cgroup/pids.current"),
+        "cgroup_memory_max": read_file("/sys/fs/cgroup/memory.max"),
+        "cgroup_memory_current": read_file("/sys/fs/cgroup/memory.current"),
+        # cgroup v1 fallback paths (older hosts)
+        "cgroup_v1_pids_max": read_file("/sys/fs/cgroup/pids/pids.max"),
+        "cgroup_v1_pids_current": read_file("/sys/fs/cgroup/pids/pids.current"),
+        # this server process's own rlimits, for comparison
+        "rlimit_nproc": resource.getrlimit(resource.RLIMIT_NPROC),
+        "rlimit_as": resource.getrlimit(resource.RLIMIT_AS),
+        "configured_max_processes": MAX_PROCESSES,
+    }
