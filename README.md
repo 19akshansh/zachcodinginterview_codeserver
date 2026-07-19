@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/19akshansh/zachcodinginterview">Main Project</a>
   ·
-  <a href="https://zachcodinginterview.vercel.com">Live App</a>
+  <a href="https://zachcodinginterview.vercel.app">Live App</a>
   ·
   <a href="https://github.com/19akshansh/zachcodinginterview_codeserver/issues">Report Bug</a>
   ·
